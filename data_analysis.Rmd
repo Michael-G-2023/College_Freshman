@@ -1,0 +1,678 @@
+---
+title: "Analysis of NHANES 2018 Health Data"
+date: \today
+output:
+  html_document: 
+   toc: true
+  word_document: default
+  pdf_document: 
+    keep_tex:  true
+geometry: left=1cm,right=1cm,top=1cm,bottom=2cm
+---
+
+
+```{r plot0, fig.width = 5.5, fig.height = 5.5, message = FALSE, echo = FALSE}
+# set seed of random number generator
+set.seed(09062023)
+
+# load R libraries
+library(gdata)
+library(lme4)
+library(lsmeans)
+library(mice)
+library(ggplot2)
+library(lattice)
+library(foreign)
+library(nlme)
+library(lmerTest)
+library(sjPlot)
+library(ROCR)
+library(pscl)
+library(knitr)
+library(car)
+library(quantreg)
+library(Hmisc)
+library(corrplot)
+library(leaps)
+library(reportROC)
+library(OptimalCutpoints)
+library(tableone)
+library(boot)
+library(rpart)
+library(glmnet)
+library(formatR)
+library(gridExtra)
+library(dplyr)
+library(keras)
+library(plotly)
+library(tensorflow)
+
+knit_hooks$set(
+  time = function(before, envir) {
+    t <- proc.time()['elapsed']
+    if(before) {
+      envir$.elapsed <- t
+    } else {
+      paste('Elapsed time: ', signif(t - envir$.elapsed), ' sec.')
+    }
+  }
+)
+
+kableone <- function(x, ...) {
+  capture.output(x <- print(x, showAllLevels = TRUE, ...))
+  knitr::kable(x, ...)
+}
+
+knitr::opts_chunk$set(tidy.opts = list(width.cutoff = 80), tidy = TRUE)
+```
+
+
+
+# 0. Data Processing in python
+
+```{python, warning = FALSE}
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+demo = pd.read_sas("DEMO_J.XPT")
+diabetes = pd.read_sas("DIQ_J.XPT")
+bld_pr = pd.read_sas("BPX_J.XPT")
+bmi_m = pd.read_sas("BMX_J.XPT")
+
+demo.head()
+
+bld_pr.head()
+
+bmi_m.head()
+
+merged_inner_1 = pd.merge(left=demo, right=bmi_m, left_on="SEQN", right_on="SEQN")
+merged_inner_2 = pd.merge(left=merged_inner_1, right=bld_pr, left_on="SEQN", right_on="SEQN")
+combined = pd.merge(left=merged_inner_2, right = diabetes, left_on="SEQN", right_on = "SEQN")
+
+combined.head()
+
+health = combined[["RIDRETH3","RIAGENDR","RIDAGEYR","BMXBMI","BPXPLS","BPXPULS","BPXSY2", "BPXDI2", "DIQ010"]]
+
+health = health.rename(columns={"RIDRETH3": "RACE","RIAGENDR": "SEX", "RIDAGEYR" : "AGE", "BMXBMI": "BMI", "BPXPLS":"PULSE_P/M", "BPXPULS":"PULSE_TYPE", "BPXSY2":"BLD_PRE_S", "BPXDI2":"BLD_PRE_D", "DIQ010":"DIABETES" })
+health.head()
+
+for i in range(0,len(health["RACE"])):
+    if health["RACE"][i] == 1.0:
+        health["RACE"][i] = "MEX_AMER"
+    if health["RACE"][i] == 2.0:
+        health["RACE"][i] = "HISPANIC"
+    if health["RACE"][i] == 3.0:
+        health["RACE"][i] = "N_H_WHITE"
+    if health["RACE"][i] == 4.0:
+        health["RACE"][i] = "N_H_BLACK"
+    if health["RACE"][i] == 6.0:
+        health["RACE"][i] = "N_H_ASIAN"
+    if health["RACE"][i] == 7.0:
+        health["RACE"][i] = "O_R_MULTI"
+
+for j in range(0,len(health["SEX"])):
+    if health["SEX"][j] == 1.0:
+        health["SEX"][j] = "MALE"
+    if health["SEX"][j] == 2.0:
+        health["SEX"][j] = "FEMALE"
+
+for k in range(0,len(health["PULSE_TYPE"])):
+    if health["PULSE_TYPE"][k] == 1.0:
+        health["PULSE_TYPE"][k] = "REGULAR"
+    if health["PULSE_TYPE"][k] == 2.0:
+        health["PULSE_TYPE"][k] = "IRREGULAR"
+
+for z in range(0,len(health["DIABETES"])):
+    if health["DIABETES"][z] == 1.0:
+        health["DIABETES"][z] = "YES"
+    if health["DIABETES"][z] == 2.0:
+        health["DIABETES"][z] = "NO"
+    if health["DIABETES"][z] == 3.0:
+        health["DIABETES"][z] = "BORDERLINE"
+
+ax = sns.countplot(x="RACE",data=health)
+
+ax = sns.countplot(x="SEX",data=health)
+
+ax = sns.countplot(x="AGE",data=health)
+
+health.tail()
+
+health.to_csv("health_data.csv", sep=',', index=False, encoding='utf-8')
+```
+
+
+
+
+
+# 1. Data description 
+
+
+## 1.1 Data import in R
+
+------------------------------------------------
+
+
+```{r sec1.1, fig.width = 5.5, fig.height = 5.5, message = FALSE, comment = "#", time = TRUE}
+# import the data in  R
+mydata <- read.csv("health_data.csv")
+dim(mydata)
+
+# rename columns
+names(mydata) <- c("Race", "Sex", "Age", "BMI", "Pulse", "Pulse_type", "BPS", "BPD", "Diabetes")
+names(mydata)
+
+# variable names
+colnames(mydata)
+
+# Race
+table(mydata$Race, useNA = "always")
+mydata$Race <- case_match(mydata$Race, 
+    "HISPANIC" ~ "Hispanic", 
+    "MEX_AMER" ~ "Mex_Amer",
+    "N_H_ASIAN" ~ "Asian", 
+    "N_H_BLACK" ~ "Black", 
+    "N_H_WHITE" ~ "White", 
+    "O_R_MULTI" ~ "Other")
+print(prop.table(table(mydata$Race, useNA = "always")), digits = 1)
+mydata$Race <- factor(mydata$Race)
+mydata$Race <- relevel(mydata$Race, ref = "White")
+table(mydata$Race, useNA = "always")
+
+# Sex
+table(mydata$Sex, useNA = "always")
+mydata$Sex <- case_match(mydata$Sex, 
+    "FEMALE" ~ "Female", 
+    "MALE" ~ "Male")
+print(prop.table(table(mydata$Sex, useNA = "always")), digits = 3)
+
+# Diabetes
+table(mydata$Diabetes, useNA = "always")
+mydata$Diabetes <- case_match(mydata$Diabetes, 
+    "9.0" ~ NA, 
+    "BORDERLINE" ~ "Yes",
+    "NO" ~ "No", 
+    "YES" ~ "Yes")
+print(prop.table(table(mydata$Diabetes, useNA = "always")), digits = 5)
+# create binary Diabetes
+mydata$Diabetes.b <- ifelse(mydata$Diabetes == "Yes", 1, 0)
+
+# Pulse_type
+table(mydata$Pulse_type, useNA = "always")
+mydata$Pulse_type <- case_match(mydata$Pulse_type, 
+    "" ~ NA, 
+    "IRREGULAR" ~ "Irregular",
+    "REGULAR" ~ "Regular")
+print(prop.table(table(mydata$Pulse_type, useNA = "always")), digits = 5)
+
+# Age
+summary(mydata$Age)
+
+# BMI
+summary(mydata$BMI)
+
+# Pulse
+summary(mydata$Pulse)
+
+# BPS
+summary(mydata$BPS)
+
+# BPD
+summary(mydata$BPD)
+
+# subset participants with complete data
+mydata <- subset(mydata, subset = complete.cases(mydata))
+dim(mydata)
+```
+
+
+\newpage 
+
+## 1.2 Table 1 stratified by Sex
+
+-------------------------------------
+
+
+```{r sec1.2, fig.width = 5.5, fig.height = 5.5, message = FALSE, comment = "#", time = TRUE}
+# table one
+allvars <- names(mydata)
+contvars <- c("Age", "BMI", "Pulse", "BPS", "BPD")
+catvars <- setdiff(allvars, contvars)
+catvars0 <- setdiff(catvars, "Sex")
+
+tableone <- CreateTableOne(vars = allvars, 
+  strata = "Sex", 
+  addOverall = TRUE, 
+  factorVars = catvars0,
+  data = mydata)
+kableone(tableone)
+```
+
+
+\newpage 
+
+## 1.3 Table One stratified by Sex
+
+-------------------------------------------
+
+
+```{r sec1.3, fig.width = 5.5, fig.height = 5.5, message = FALSE, comment = "#", time = TRUE}
+catvars0 <- setdiff(catvars, "Race")
+
+tableone <- CreateTableOne(vars = allvars, 
+  strata = "Race", 
+  addOverall = TRUE, 
+  factorVars = catvars0,
+  data = mydata)
+kableone(tableone)
+```
+
+
+\newpage
+
+## 1.4 Correlation analysis
+
+---------------------------------------
+
+
+```{r sec1.4, fig.width = 6.5, fig.height = 6.5, message = FALSE, comment = "#", time = TRUE}
+# overall correlation matrix 
+rcorr(as.matrix(mydata[, contvars]))
+corrplot(rcorr(as.matrix(mydata[, contvars]))$r)
+```
+
+
+\newpage 
+
+
+## 1.5 Graphical summaries
+
+## 1.5a Graphical summaries for BPD vs covariates stratified by sex
+
+-------------------------------------------------------------------------
+
+
+```{r sec1.5a, fig.width = 5.5, fig.height = 5.5, message = FALSE, comment = "#", time = TRUE}
+# plot BMI vs Age
+ggplot(mydata,
+  aes(y = BMI, x = Age, color = Sex, shape = Sex)) +
+  geom_point() + 
+  geom_smooth(method = "lm", fill = NA, formula = y ~ x + I(x^2)) +
+  xlab("Age (years)") + 
+  ylab("BMI")
+
+# plot BPS vs Age
+ggplot(mydata,
+  aes(y = BPS, x = Age, color = Sex, shape = Sex)) +
+  geom_point() + 
+  geom_smooth(method = "lm", fill = NA, formula = y ~ x + I(x^2)) +
+  xlab("Age") + 
+  ylab("BPS")
+
+# plot BPD vs Age
+ggplot(mydata,
+  aes(y = BPD, x = Age, color = Sex, shape = Sex)) +
+  geom_point() + 
+  geom_smooth(method = "lm", fill = NA, formula = y ~ x + I(x^2)) +
+  xlab("Age") + 
+  ylab("BPD")
+
+```
+
+
+
+
+\newpage 
+
+
+# 2. Linear Regression Models
+
+
+
+## 2.1 Regression models for BPS vs BMI, Sex, Race, Pulse
+
+-----------------------------------------------
+
+
+
+```{r sec2.1, fig.width = 5.5, fig.height = 5.5, message = FALSE, comment = "#", time = TRUE}
+# center the predictors to interpret the intercepts
+mydata$Age.c <- scale(mydata$Age, scale = FALSE)
+summary(mydata$Age.c)
+mydata$BMI.c <- scale(mydata$BMI, scale = FALSE)
+summary(mydata$BMI.c)
+mydata$Pulse.c <- scale(mydata$Pulse, scale = FALSE)
+summary(mydata$Pulse.c)
+
+# null model
+lm.out <- lm(BPS ~ Age.c + BMI.c + Sex + Race + Pulse.c, data = mydata)
+summary(lm.out)
+
+# fit best subset regression
+lm.out <- regsubsets(BPS ~ Age.c + I(Age.c * Age.c) + Pulse.c +  I(Pulse.c * Pulse.c) + 
+  I(Age.c * Pulse.c) + BMI.c + I(BMI.c * BMI.c) + I(BMI.c * Age.c) + I(BMI.c * Pulse.c) + 
+  Race + Race : BMI.c + Race: Pulse.c + Race : Age.c + Sex + Sex : BMI.c + Sex : Pulse.c + 
+  Sex : Age.c, data = mydata)
+summary(lm.out)$adjr2
+summary(lm.out)$which[summary(lm.out)$adjr2 == max(summary(lm.out)$adjr2), ]
+myind <- summary(lm.out)$which[summary(lm.out)$adjr2 == max(summary(lm.out)$adjr2), ][-1]
+names(summary(lm.out)$which[summary(lm.out)$adjr2 == max(summary(lm.out)$adjr2), ])[-1][myind]
+
+# final model 
+lm.out <- lm(BPS ~ Age.c + Pulse.c + I(Age.c * Pulse.c) + BMI.c + I(BMI.c * Age.c) + Race + Sex + 
+  Sex : Age.c + Race : Age.c, data = mydata)
+summary(lm.out)
+
+# train data 
+tprob <- 0.7
+tind <- rbinom(nrow(mydata), 1, tprob)
+tdata <- subset(mydata, subset = tind == 1)
+dim(tdata)
+
+vdata <- subset(mydata, subset = tind == 0)
+dim(vdata)
+
+# fit the model on the training data
+lm.out <- lm(BPS ~ Age.c + Pulse.c + I(Age.c * Pulse.c) + BMI.c + I(BMI.c * Age.c) + Race + Sex + 
+  Sex : Age.c + Race : Age.c, data = tdata)
+summary(lm.out)
+
+# predict BPS on vdata
+vpred <- predict(lm.out, newdata = vdata)
+1 - sum((vpred - vdata$BPS)^2) / sum((vdata$BPS - mean(vdata$BPS))^2)
+```
+
+
+\newpage 
+
+
+
+
+## 2.2 Regression models for BPD vs BMI, Sex, Race, Pulse
+
+-----------------------------------------------
+
+
+
+```{r sec2.2, fig.width = 5.5, fig.height = 5.5, message = FALSE, comment = "#", time = TRUE}
+# null model
+lm.out <- lm(BPD ~ Age.c + BMI.c + Sex + Race + Pulse.c, data = mydata)
+summary(lm.out)
+
+# fit best subset regression
+lm.out <- regsubsets(BPD ~ Age.c + I(Age.c * Age.c) + Pulse.c +  I(Pulse.c * Pulse.c) + 
+  I(Age.c * Pulse.c) + BMI.c + I(BMI.c * BMI.c) + I(BMI.c * Age.c) + I(BMI.c * Pulse.c) + 
+  Race + Race : BMI.c + Race: Pulse.c + Race : Age.c + Sex + Sex : BMI.c + Sex : Pulse.c + 
+  Sex : Age.c, data = mydata)
+summary(lm.out)$adjr2
+summary(lm.out)$which[summary(lm.out)$adjr2 == max(summary(lm.out)$adjr2), ]
+myind <- summary(lm.out)$which[summary(lm.out)$adjr2 == max(summary(lm.out)$adjr2), ][-1]
+names(summary(lm.out)$which[summary(lm.out)$adjr2 == max(summary(lm.out)$adjr2), ])[-1][myind]
+
+# final model 
+lm.out <- lm(BPD ~ Age.c + I(Age.c * Age.c) + Pulse.c + I(Pulse.c * Pulse.c) + BMI.c + I(BMI.c * Age.c) + 
+  Race + Sex + Sex : BMI.c + Race : Age.c, data = mydata)
+summary(lm.out)
+
+# fit the model on the training data
+lm.out <- lm(BPD ~ Age.c + I(Age.c * Age.c) + Pulse.c + I(Pulse.c * Pulse.c) + BMI.c + I(BMI.c * Age.c) + 
+  Race + Sex + Sex : BMI.c + Race : Age.c, data = tdata)
+summary(lm.out)
+
+# predict BPS on vdata
+vpred <- predict(lm.out, newdata = vdata)
+1 - sum((vpred - vdata$BPD)^2) / sum((vdata$BPD - mean(vdata$BPD))^2)
+```
+
+
+\newpage 
+
+
+
+
+## 2.3 Regression models for Diabetes vs BMI, Sex, Race, Pulse
+
+-----------------------------------------------
+
+
+
+```{r sec2.3, fig.width = 5.5, fig.height = 5.5, message = FALSE, comment = "#", time = TRUE}
+# null model
+glm.out <- glm(Diabetes.b ~ Age.c + BMI.c + Sex + Race + Pulse.c + BPS + BPD, data = mydata,
+               family = binomial)
+summary(glm.out)
+
+mytab <- data.frame(
+  OR = exp(summary(glm.out)$coef[ , 1]), 
+  SE = exp(summary(glm.out)$coef[ , 1]) * summary(glm.out)$coef[ , 2], 
+  LCL = exp(summary(glm.out)$coef[ , 1]) - 1.96 * exp(summary(glm.out)$coef[ , 1]) * summary(glm.out)$coef[ , 2], 
+  UCL = exp(summary(glm.out)$coef[ , 1]) - 1.96 * exp(summary(glm.out)$coef[ , 1]) * summary(glm.out)$coef[ , 2])
+kable(mytab, digits = 3)
+
+# accuracy 
+glm.pred <- predict(glm.out, type = "response")
+glm.predb <- ifelse(glm.pred >= 0.13, 1, 0)
+table(glm.predb, mydata$Diabetes.b)
+prop.table(table(glm.predb, mydata$Diabetes.b))
+prop.table(table(glm.predb, mydata$Diabetes.b), margin = 2)
+
+# ROC 
+reportROC(mydata$Diabetes.b, glm.pred)
+
+# fit the model on the training data
+glm.out <- glm(Diabetes.b ~ Age.c + BMI.c + Sex + Race + Pulse.c + BPS + BPD, data = 
+  tdata, family = binomial)
+summary(glm.out)
+
+# predict BPS on vdata
+vpred <- predict(glm.out, newdata = vdata, type = "response")
+glm.predb <- ifelse(vpred >= 0.13, 1, 0)
+table(glm.predb, vdata$Diabetes.b)
+prop.table(table(glm.predb, vdata$Diabetes.b), margin = 2)
+prop.table(table(glm.predb, vdata$Diabetes.b), margin = 1)
+```
+
+
+\newpage
+
+# 3. Deep Learning Models
+
+## 3.1 BPS
+
+```{r sec3.1, fig.width = 5.5, fig.height = 5.5, message = FALSE, comment = "#", time = TRUE}
+x_train <- model.matrix(~ 0 + Race : Sex + Age.c + BMI.c + Pulse.c, data = tdata)
+x_test <- model.matrix(~ 0 + Race : Sex + Age.c + BMI.c + Pulse.c, data = vdata)
+y_test <- vdata$BPS
+y_train <- tdata$BPS
+
+# set up the model for deep neural network
+mymodel <- keras_model_sequential()
+mymodel %>% 
+  layer_dense(
+    name = "Layer1",
+    units = 15, 
+    activation = "relu",
+    input_shape = c(15)) %>%
+  layer_dense(
+    name = "Layer2",
+    units = 15,
+    activation = "relu") %>%
+  layer_dense(
+    name = "OutputLayer", 
+    units = 1, 
+    activation = "linear")
+
+# summary model 
+summary(mymodel)
+
+# compile the model
+mymodel %>% compile(
+  loss = "mean_squared_error", 
+  optimizer = "adam", 
+  metrics = "mean_squared_error")
+
+# fit the model 
+history <- mymodel %>% 
+  fit(x_train,
+      y_train, 
+      epoch = 500, 
+      batch_size = 256, 
+      validation_split = 0.3,
+      verbose = 0)
+
+plot(history)
+
+# prediction for training data
+mypred <- predict(mymodel, x_train)
+
+# r-squared for train data
+1 - sum((y_train - mypred)^2) / sum((y_train - mean(y_train))^2)
+
+# prediction for test data
+mypred <- predict(mymodel, x_test)
+
+# r-squared for test data
+1 - sum((y_test - mypred)^2) / sum((y_test - mean(y_test))^2)
+```
+
+\newpage 
+
+
+## 3.2 BPD
+
+```{r sec3.2, fig.width = 5.5, fig.height = 5.5, message = FALSE, comment = "#", time = TRUE}
+y_test <- vdata$BPD
+y_train <- tdata$BPD
+
+# set up the model for deep neural network
+mymodel <- keras_model_sequential()
+mymodel %>% 
+  layer_dense(
+    name = "Layer1",
+    units = 15, 
+    activation = "relu",
+    input_shape = c(15)) %>%
+  layer_dense(
+    name = "Layer2",
+    units = 15,
+    activation = "relu") %>%
+  layer_dense(
+    name = "OutputLayer", 
+    units = 1, 
+    activation = "linear")
+
+# summary model 
+summary(mymodel)
+
+# compile the model
+mymodel %>% compile(
+  loss = "mean_squared_error", 
+  optimizer = "adam", 
+  metrics = "mean_squared_error")
+
+# fit the model 
+history <- mymodel %>% 
+  fit(x_train,
+      y_train, 
+      epoch = 500, 
+      batch_size = 256, 
+      validation_split = 0.3,
+      verbose = 0)
+plot(history)
+
+# prediction for training data
+mypred <- predict(mymodel, x_train)
+
+# r-squared for train data
+1 - sum((y_train - mypred)^2) / sum((y_train - mean(y_train))^2)
+
+# prediction for test data
+mypred <- predict(mymodel, x_test)
+
+# r-squared for train data
+1 - sum((y_test - mypred)^2) / sum((y_test - mean(y_test))^2)
+```
+
+\newpage
+
+
+
+## 3.3 Diabetes
+
+```{r sec3.3, fig.width = 5.5, fig.height = 5.5, message = FALSE, comment = "#", time = TRUE}
+y_test <- to_categorical(vdata$Diabetes.b)
+y_train <- to_categorical(tdata$Diabetes.b)
+
+# set up the model for deep neural network
+mymodel <- keras_model_sequential()
+mymodel %>% 
+  layer_dense(
+    name = "Layer1",
+    units = 15, 
+    activation = "relu",
+    input_shape = c(15)) %>%
+  layer_dense(
+    name = "Layer2",
+    units = 15,
+    activation = "relu") %>%
+  layer_dense(
+    name = "OutputLayer", 
+    units = 2, 
+    activation = "softmax")
+
+# summary model 
+summary(mymodel)
+
+# compile the model
+mymodel %>% compile(
+  loss = "categorical_crossentropy", 
+  optimizer = "adam", 
+  metrics = "accuracy")
+
+# fit the model 
+history <- mymodel %>% 
+  fit(x_train,
+      y_train, 
+      epoch = 500, 
+      batch_size = 256, 
+      validation_split = 0.3,
+      verbose = 0)
+plot(history)
+
+# prediction for training data
+mypred <- predict(mymodel, x_train)[, 2]
+
+# ROC 
+reportROC(tdata$Diabetes.b, mypred)
+
+# confusion matrix training data
+predb <- ifelse(mypred >= 0.125, 1, 0)
+table(predb, tdata$Diabetes.b)
+prop.table(table(predb, tdata$Diabetes.b))
+prop.table(table(predb, tdata$Diabetes.b), margin = 2)
+
+# confusion matrix test data
+mypred <- predict(mymodel, x_test)[, 2]
+predb <- ifelse(mypred >= 0.125, 1, 0)
+table(predb, vdata$Diabetes.b)
+prop.table(table(predb, vdata$Diabetes.b))
+prop.table(table(predb, vdata$Diabetes.b), margin = 2)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
